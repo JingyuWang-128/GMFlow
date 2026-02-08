@@ -11,7 +11,7 @@ class SecretRQVAE(nn.Module):
     def __init__(self, in_channels=3, embed_dim=256, codebook_size=1024, num_quantizers=4):
         super().__init__()
         
-        # Encoder: Downsample 4x (256 -> 64 -> 32)
+        # Encoder: Downsample 4x (256 -> 128 -> 64)
         self.encoder = nn.Sequential(
             nn.Conv2d(in_channels, 64, 4, 2, 1), nn.ReLU(),
             nn.Conv2d(64, 128, 4, 2, 1), nn.ReLU(),
@@ -20,21 +20,17 @@ class SecretRQVAE(nn.Module):
         )
         
         # Residual Vector Quantizer
-        # [最终修复方案]
-        # 1. kmeans_init=False: 禁用 Kmeans 初始化，防止 init_embed_ 广播错误
-        # 2. decay=0.0: 禁用 EMA，防止 ema_inplace 广播错误
-        # 3. accept_image_fmap=True: (默认值) 显式声明库会自动处理 [B, C, H, W] 输入
-        # 1. 初始化时
+        # 修复逻辑：启用 decay 和 kmeans_init 以确保码本能正确处理 batch 广播
         self.rq = ResidualVQ(
             dim=embed_dim,
             num_quantizers=num_quantizers,
             codebook_size=codebook_size,
-            kmeans_init=False,
-            decay=0.0,
-            ema_update=False,
-            accept_image_fmap=False
+            kmeans_init=True,          # 建议开启，有利于码本初始化
+            decay=0.8,                 # 必须 > 0 以启用 EMA，解决维度不匹配报错
+            commitment_weight=0.25,
+            accept_image_fmap=False,   # 我们在 forward 中手动重塑
+            shared_codebook=True       # 强制共享码本，防止 batch size 变化导致的错误
         )
-
         
         # Decoder
         self.decoder = nn.Sequential(
@@ -44,28 +40,25 @@ class SecretRQVAE(nn.Module):
             nn.Tanh()
         )
 
-
     def forward(self, x):
         # 1. Encode
         z = self.encoder(x)  # [B, 256, 64, 64]
         B, C, H, W = z.shape
 
-        # 2. Flatten to token sequence for ResidualVQ
-        # [B, C, H, W] -> [B, H, W, C]
-        z_flat = z.permute(0, 2, 3, 1).contiguous()
+        # 2. 重塑为 [B, N, C] 格式，这是库处理最稳定的格式
+        z_flat = z.reshape(B, H * W, C).contiguous()
 
-        # 3. Quantize (ONLY ONCE)
+        # 3. Quantize
         quantized_flat, indices, commit_loss = self.rq(z_flat)
 
         # 4. Restore feature map
-        # [B, H, W, C] -> [B, C, H, W]
-        quantized = quantized_flat.permute(0, 3, 1, 2).contiguous()
+        # [B, N, C] -> [B, C, H, W]
+        quantized = quantized_flat.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
         # 5. Decode
         recon = self.decoder(quantized)
 
-        # 6. Reshape indices if needed
-        # vector_quantize_pytorch 通常输出 [B, H*W, num_quantizers]
+        # 6. Reshape indices: [B, N, Q] -> [B, Q, H, W]
         if indices.ndim == 3:
             indices = indices.permute(0, 2, 1).contiguous()
             indices = indices.view(B, -1, H, W)
