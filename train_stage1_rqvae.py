@@ -6,6 +6,7 @@ from torch.optim import Adam
 from models.rqvae import SecretRQVAE
 from data.dataset import get_dataloader
 from utils.helpers import set_seed, get_logger, save_image_grid, compute_psnr, compute_ssim
+from tqdm import tqdm
 
 def train():
     set_seed(42)
@@ -43,18 +44,19 @@ def train():
         model.train()
         train_loss_avg = 0
         
-        for i, (_, secret, _) in enumerate(train_loader):
+        tqdm_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]", leave=False)
+        for i, (_, secret, _) in enumerate(tqdm_bar):
             secret = secret.to(device)
-            
             recon, _, commit_loss, _ = model(secret)
             recon_loss = torch.nn.functional.mse_loss(recon, secret)
-            loss = recon_loss + commit_loss
+            loss = recon_loss + commit_loss.mean()
             
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             
             train_loss_avg += loss.item()
+            tqdm_bar.set_postfix(loss=f"{loss.item():.4f}")
             
             if i % config['rqvae']['val_interval'] == 0:
                 logger.info(f"Epoch [{epoch}/{epochs}] Step [{i}] Loss: {loss.item():.4f}")
@@ -66,7 +68,7 @@ def train():
         val_psnr_avg = 0
         val_ssim_avg = 0
         with torch.no_grad():
-            for i, (_, secret, _) in enumerate(val_loader):
+            for i, (_, secret, _) in enumerate(tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]", leave=False)):
                 secret = secret.to(device)
                 recon, _, _, _ = model(secret)
                 

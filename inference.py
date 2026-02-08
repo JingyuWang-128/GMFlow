@@ -96,7 +96,7 @@ def evaluate_metrics(config, max_batches=None):
     
     print("Generating and evaluating...")
     with torch.no_grad():
-        for i, (target_img, secret_img, prompts) in enumerate(tqdm(test_loader)):
+        for i, (target_img, secret_img, prompts) in enumerate(tqdm(test_loader, desc="Evaluating", total=len(test_loader))):
             if max_batches and i >= max_batches:
                 break
                 
@@ -111,7 +111,7 @@ def evaluate_metrics(config, max_batches=None):
             x_curr = torch.randn_like(target_img).to(device) # Noise x_0
             steps = 50
             dt = 1.0 / steps
-            for k in range(steps):
+            for k in tqdm(range(steps), desc="Euler Sampling", leave=False):
                 t = torch.tensor([k / steps]).to(device)
                 v_pred, _, _ = gen_model(x_curr, t, txt_emb, s_feat)
                 x_curr = x_curr + v_pred * dt

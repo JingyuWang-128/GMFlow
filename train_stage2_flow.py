@@ -10,6 +10,7 @@ from modules.losses import GenMambaLosses
 from modules.interference import InterferenceOperatorSet
 from data.dataset import get_dataloader
 from utils.helpers import set_seed, get_logger, save_image_grid, compute_psnr, compute_bit_accuracy
+from tqdm import tqdm
 
 def train_flow():
     set_seed(42)
@@ -66,7 +67,9 @@ def train_flow():
         total_loss_meter = 0
         robust_loss_meter = 0
         
-        for i, (target_img, secret_img, prompts) in enumerate(train_loader):
+        tqdm_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Flow Train]", leave=False)
+        for i, (target_img, secret_img, prompts) in enumerate(tqdm_bar):
+
             target_img = target_img.to(device)
             secret_img = secret_img.to(device)
             
@@ -107,6 +110,12 @@ def train_flow():
             
             total_loss_meter += total_loss.item()
             robust_loss_meter += loss_robust.item()
+
+            tqdm_bar.set_postfix(
+                total=f"{total_loss.item():.4f}",
+                robust=f"{loss_robust.item():.4f}"
+            )
+
             
             if i % 50 == 0:
                 logger.info(f"Epoch [{epoch}][{i}] Total: {total_loss.item():.4f} Robust: {loss_robust.item():.4f}")
