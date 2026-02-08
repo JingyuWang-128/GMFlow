@@ -20,13 +20,18 @@ class SecretRQVAE(nn.Module):
         )
         
         # Residual Vector Quantizer
+        # [最终修复方案]
+        # 1. kmeans_init=False: 禁用 Kmeans 初始化，防止 init_embed_ 广播错误
+        # 2. decay=0.0: 禁用 EMA，防止 ema_inplace 广播错误
+        # 3. accept_image_fmap=True: (默认值) 显式声明库会自动处理 [B, C, H, W] 输入
         self.rq = ResidualVQ(
             dim=embed_dim,
             num_quantizers=num_quantizers,
             codebook_size=codebook_size,
-            kmeans_init=False,    
+            kmeans_init=False,    # 关闭 Kmeans
             kmeans_iters=10,
-            decay=0.0             # 必须为 0.0 以修复 RuntimeError broadcast shape
+            decay=0.0,            # 关闭 EMA
+            accept_image_fmap=True # 库会自动处理维度，不需要我们在外面 permute
         )
         
         # Decoder: Upsample 4x
@@ -42,35 +47,26 @@ class SecretRQVAE(nn.Module):
         # 1. 编码
         z = self.encoder(x) # Shape: [B, C=256, H=64, W=64]
         
-        # 2. 维度置换 (Channel Last)
-        # ResidualVQ 需要输入的最后一个维度是 embed_dim (256)
-        # 所以我们将 [B, C, H, W] -> [B, H, W, C]
-        z_permuted = z.permute(0, 2, 3, 1).contiguous()
+        # [修复] 
+        # 直接传入 [B, C, H, W]，不要使用 permute！
+        # 库内部会自动识别这是图像，并将其转为 [B, H, W, C] 进行处理，最后再转回来。
         
-        # 3. 残差量化
-        # quantized: [B, H, W, C]
-        # indices: [B, H*W, Num_Q] (库的输出形状可能略有不同，下面会统一处理)
-        quantized, indices, commit_loss = self.rq(z_permuted)
+        # quantized: [B, C, H, W] (自动转回)
+        # indices: [B, H*W, Num_Q] (通常库输出 flatten 后的 indices)
+        quantized, indices, commit_loss = self.rq(z)
         
-        # 4. 维度还原 (Channel First)
-        # [B, H, W, C] -> [B, C, H, W] 以供 Decoder 使用
-        quantized = quantized.permute(0, 3, 1, 2).contiguous()
-        
-        # 5. 解码
+        # 2. 解码
         recon = self.decoder(quantized)
         
-        # 6. 处理 Indices 形状
-        # 我们希望输出统一为 [B, Num_Q, H, W]
-        B, H, W, C = z_permuted.shape
+        # 3. 处理 Indices 形状
+        # 我们希望输出统一为 [B, Num_Q, H, W] 方便后续计算 Loss
+        B, C, H, W = z.shape # 注意这里的 H, W 是 Feature map 的大小 (64)
         
-        # 如果 indices 是 3D 张量，通常是 [Batch, Sequence_Length, Num_Quantizers]
+        # vector_quantize_pytorch 输出的 indices 形状可能是 [B, H*W, Num_Q]
         if indices.ndim == 3:
-            # 检查最后一个维度是不是 Num_Quantizers
-            if indices.shape[-1] == self.rq.num_quantizers:
-                # [B, Seq, Num_Q] -> [B, Num_Q, Seq] -> [B, Num_Q, H, W]
-                indices = indices.permute(0, 2, 1).view(B, -1, H, W)
-            else:
-                # 某些版本可能是 [B, Num_Q, Seq]
-                indices = indices.view(B, -1, H, W)
+            # Case: [B, Seq_Len, Num_Q] -> [B, Num_Q, Seq_Len]
+            indices = indices.permute(0, 2, 1)
+            # -> [B, Num_Q, H, W]
+            indices = indices.view(B, -1, H, W)
                 
         return recon, indices, commit_loss, quantized
