@@ -2,11 +2,15 @@
 experiment:
   name: "GenMambaFlow_v1"
   device: "cuda"
+  log_dir: "./logs"
+  checkpoint_dir: "./checkpoints"
+  result_dir: "./results"
+  seed: 42
 
 data:
-  root_dir: "./data"     # <--- 确保这里指向你的 data 文件夹路径
+  root_dir: "./data"     # 确保数据放在 data/train 和 data/test 下
   image_size: 256
-  batch_size: 4
+  batch_size: 4          # 显存允许可调大
   num_workers: 4
 
 rqvae:
@@ -14,10 +18,22 @@ rqvae:
   codebook_size: 1024
   num_quantizers: 4
   learning_rate: 1.0e-4
+  epochs: 50
+  val_interval: 100       # 多少个 step 验证一次
+  save_interval: 5        # 多少个 epoch 保存一次
 
 gen_flow:
   in_channels: 3
   dim: 128
   secret_dim: 256
   learning_rate: 1.0e-4
-  num_steps: 100000
+  epochs: 100
+  val_interval: 200
+  save_interval: 5
+  lambda_flow: 1.0
+  lambda_rsmi: 0.1
+  lambda_robust: 0.5
+
+interference:
+  jpeg_quality: 50
+  noise_std: 0.1

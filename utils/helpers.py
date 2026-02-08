@@ -4,10 +4,11 @@ import torch.nn.functional as F
 import numpy as np
 import random
 import os
+import logging
 import torchvision
+from datetime import datetime
 
 def set_seed(seed=42):
-    """固定随机种子以保证可复现性"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -15,73 +16,60 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def count_parameters(model):
-    """计算模型可训练参数量"""
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def get_logger(log_dir, name="experiment"):
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(log_dir, f"{name}_{timestamp}.log")
+    
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    
+    # File handler
+    fh = logging.FileHandler(log_file)
+    fh.setLevel(logging.INFO)
+    
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
 
 def denormalize(tensor):
-    """将 [-1, 1] 的 Tensor 反归一化到 [0, 1] 用于保存"""
+    """[-1, 1] -> [0, 1]"""
     return (tensor * 0.5 + 0.5).clamp(0, 1)
 
 def compute_psnr(img1, img2):
-    """
-    计算两个图像 Tensor 之间的 PSNR
-    img1, img2: [B, C, H, W] in range [-1, 1] or [0, 1]
-    """
-    # 确保在 [0, 1] 范围内计算
-    if img1.min() < 0:
-        img1 = denormalize(img1)
-    if img2.min() < 0:
-        img2 = denormalize(img2)
-        
-    mse = F.mse_loss(img1, img2, reduction='none')
-    mse = mse.view(mse.shape[0], -1).mean(dim=1)
-    psnr = 10. * torch.log10(1. / mse)
+    """img1, img2: [B, C, H, W] in [-1, 1]"""
+    img1 = denormalize(img1)
+    img2 = denormalize(img2)
+    mse = F.mse_loss(img1, img2, reduction='none').mean(dim=[1,2,3])
+    psnr = 10 * torch.log10(1.0 / (mse + 1e-8))
     return psnr.mean().item()
 
 def compute_ssim(img1, img2):
-    """
-    计算 SSIM。这里使用 Kornia 库，因为它高效且可微。
-    如果没有安装 kornia，则需要手动实现或使用 torchmetrics。
-    """
+    """需要 kornia"""
     try:
         import kornia.metrics as metrics
-        # Kornia expects images in [0, 1]
-        if img1.min() < 0: img1 = denormalize(img1)
-        if img2.min() < 0: img2 = denormalize(img2)
-        
-        # window_size=11 is standard for SSIM
-        ssim_val = metrics.ssim(img1, img2, window_size=11, reduction='mean')
-        return ssim_val.item()
+        img1 = denormalize(img1)
+        img2 = denormalize(img2)
+        return metrics.ssim(img1, img2, window_size=11, reduction='mean').item()
     except ImportError:
-        print("Warning: Kornia not found, skipping SSIM calculation.")
         return 0.0
 
-def save_image_grid(images, path, nrow=4):
-    """保存图像网格"""
-    # images: List of tensors or a single tensor [B, C, H, W]
-    if isinstance(images, list):
-        images = torch.stack(images, dim=0)
-    
-    # 反归一化
-    if images.min() < 0:
+def compute_bit_accuracy(pred_indices, target_indices):
+    """计算离散 Token 的恢复准确率"""
+    # pred_indices: [B, Q, H, W]
+    # target_indices: [B, Q, H, W]
+    correct = (pred_indices == target_indices).float()
+    return correct.mean().item()
+
+def save_image_grid(images, path, nrow=4, normalize=True):
+    if normalize:
         images = denormalize(images)
-        
     torchvision.utils.save_image(images, path, nrow=nrow)
-
-class AverageMeter:
-    """计算并存储平均值和当前值"""
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
