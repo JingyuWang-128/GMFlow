@@ -12,3 +12,4 @@ mamba-ssm>=1.1.1
 torchmetrics[image]>=1.0.0
 lpips
 scipy
+vector-quantize-pytorch>=1.12.0

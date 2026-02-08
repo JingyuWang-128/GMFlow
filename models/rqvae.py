@@ -24,31 +24,53 @@ class SecretRQVAE(nn.Module):
             dim=embed_dim,
             num_quantizers=num_quantizers,
             codebook_size=codebook_size,
-            kmeans_init=True,
-            kmeans_iters=10
+            kmeans_init=False,    
+            kmeans_iters=10,
+            decay=0.0             # 必须为 0.0 以修复 RuntimeError broadcast shape
         )
         
         # Decoder: Upsample 4x
         self.decoder = nn.Sequential(
             nn.Conv2d(embed_dim, 128, 3, 1, 1), nn.ReLU(),
             nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.ReLU(),
+            nn.ConvTranspose2d(64, 64, 4, 2, 1), nn.ReLU(),
             nn.ConvTranspose2d(64, in_channels, 4, 2, 1),
             nn.Tanh() # [-1, 1]
         )
 
     def forward(self, x):
-        z = self.encoder(x) # [B, C, H/4, W/4]
-        z_permuted = z.permute(0, 2, 3, 1) # [B, H, W, C]
+        # 1. 编码
+        z = self.encoder(x) # Shape: [B, C=256, H=64, W=64]
         
-        # quantized: 重建用的特征
-        # indices: [B, H*W, Num_Quantizers] (离散码)
+        # 2. 维度置换 (Channel Last)
+        # ResidualVQ 需要输入的最后一个维度是 embed_dim (256)
+        # 所以我们将 [B, C, H, W] -> [B, H, W, C]
+        z_permuted = z.permute(0, 2, 3, 1).contiguous()
+        
+        # 3. 残差量化
+        # quantized: [B, H, W, C]
+        # indices: [B, H*W, Num_Q] (库的输出形状可能略有不同，下面会统一处理)
         quantized, indices, commit_loss = self.rq(z_permuted)
         
-        quantized = quantized.permute(0, 3, 1, 2)
+        # 4. 维度还原 (Channel First)
+        # [B, H, W, C] -> [B, C, H, W] 以供 Decoder 使用
+        quantized = quantized.permute(0, 3, 1, 2).contiguous()
+        
+        # 5. 解码
         recon = self.decoder(quantized)
         
-        # Reshape indices for convenience: [B, Num_Q, H, W]
-        B, H, W, _ = z_permuted.shape
-        indices = indices.view(B, H, W, -1).permute(0, 3, 1, 2)
+        # 6. 处理 Indices 形状
+        # 我们希望输出统一为 [B, Num_Q, H, W]
+        B, H, W, C = z_permuted.shape
         
+        # 如果 indices 是 3D 张量，通常是 [Batch, Sequence_Length, Num_Quantizers]
+        if indices.ndim == 3:
+            # 检查最后一个维度是不是 Num_Quantizers
+            if indices.shape[-1] == self.rq.num_quantizers:
+                # [B, Seq, Num_Q] -> [B, Num_Q, Seq] -> [B, Num_Q, H, W]
+                indices = indices.permute(0, 2, 1).view(B, -1, H, W)
+            else:
+                # 某些版本可能是 [B, Num_Q, Seq]
+                indices = indices.view(B, -1, H, W)
+                
         return recon, indices, commit_loss, quantized
