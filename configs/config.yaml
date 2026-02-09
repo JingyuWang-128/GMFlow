@@ -18,18 +18,18 @@ rqvae:
   codebook_size: 1024
   num_quantizers: 4
   learning_rate: 1.0e-4
-  epochs: 50
+  epochs: 500
   val_interval: 100       # 多少个 step 验证一次
-  save_interval: 5        # 多少个 epoch 保存一次
+  save_interval: 50        # 多少个 epoch 保存一次
 
 gen_flow:
   in_channels: 3
   dim: 128
   secret_dim: 256
   learning_rate: 1.0e-4
-  epochs: 100
+  epochs: 1000
   val_interval: 200
-  save_interval: 5
+  save_interval: 100
   lambda_flow: 1.0
   lambda_rsmi: 0.1
   lambda_robust: 0.5

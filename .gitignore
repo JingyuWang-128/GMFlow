@@ -7,3 +7,4 @@ logs/
 figure/
 checkpoints/
 __pycache__/
+results/

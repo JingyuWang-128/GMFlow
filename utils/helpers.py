@@ -53,12 +53,13 @@ def compute_psnr(img1, img2):
     return psnr.mean().item()
 
 def compute_ssim(img1, img2):
-    """需要 kornia"""
     try:
         import kornia.metrics as metrics
         img1 = denormalize(img1)
         img2 = denormalize(img2)
-        return metrics.ssim(img1, img2, window_size=11, reduction='mean').item()
+        
+        return metrics.ssim(img1, img2, window_size=11).mean().item()
+        
     except ImportError:
         return 0.0
 
