@@ -30,20 +30,59 @@ class GenMambaLosses:
         return F.cross_entropy(logits, labels)
 
     @staticmethod
-    def robust_decode_loss(pred_indices, target_indices):
+    def robust_decode_loss(pred_logits, s_indices):
         """
-        解码分类损失 (Cross Entropy)
-        pred_indices: [B, Num_Quantizers, Seq_Len, Codebook_Size] (Logits)
-        target_indices: [B, Num_Quantizers, Seq_Len]
+        pred_logits: [B, Q, K, N]
+        s_indices  : [B, Q, N]
         """
-        # Flatten for CE
-        loss = 0
-        num_q = pred_indices.shape[1]
-        for i in range(num_q):
-             # 简单的加权：第一层权重最大，后续递减
-            weight = 1.0 / (i + 1)
-            loss += weight * F.cross_entropy(
-                pred_indices[:, i].permute(0, 2, 1), # [B, Classes, Seq]
-                target_indices[:, i]
+        # -----------------------------
+        # 1. 自检（非常关键）
+        # # -----------------------------
+        # assert pred_logits.dim() == 4, \
+        #     f"pred_logits must be 4D [B,Q,K,N], got {pred_logits.shape}"
+        # assert s_indices.dim() == 3, \
+        #     f"s_indices must be 3D [B,Q,N], got {s_indices.shape}"
+
+        B, Q, K, N = pred_logits.shape
+        Bs, Qs, Ns = s_indices.shape
+
+        # assert B == Bs, f"B mismatch: {B} vs {Bs}"
+        # assert Q == Qs, f"Q mismatch: {Q} vs {Qs}"
+        # assert N == Ns, f"N mismatch: {N} vs {Ns}"
+
+        # # 索引合法性检查（防 silent bug）
+        # if not torch.all((s_indices >= 0) & (s_indices < K)):
+        #     raise ValueError(
+        #         f"s_indices out of range [0, {K-1}]"
+        #     )
+
+        # -----------------------------
+        # 2. 正确计算 CE loss
+        # -----------------------------
+        total_loss = 0.0
+
+        for q in range(Q):
+            # [B, K, N] → [B, N, K] → [B*N, K]
+            logits_q = (
+                pred_logits[:, q]
+                .permute(0, 2, 1)
+                .contiguous()
+                .view(B * N, K)
             )
-        return loss
+
+            # [B, N] → [B*N]
+            targets_q = (
+                s_indices[:, q]
+                .contiguous()
+                .view(B * N)
+            )
+
+            loss_q = F.cross_entropy(
+                logits_q,
+                targets_q,
+                reduction="mean"
+            )
+
+            total_loss += loss_q
+
+        return total_loss / Q
