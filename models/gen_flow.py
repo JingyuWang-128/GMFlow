@@ -1,10 +1,8 @@
 # models/gen_flow.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .mamba_block import VisionMambaBlock
-
-# print(">>> IMPORTING GEN_FLOW FROM:", __file__)
-
 
 class TriStreamMambaUNet(nn.Module):
     def __init__(self, in_channels=3, dim=128, secret_dim=256):
@@ -17,6 +15,10 @@ class TriStreamMambaUNet(nn.Module):
         self.text_proj = nn.Linear(768, dim)
 
         self.secret_proj = nn.Linear(secret_dim, dim * 4)
+        
+        # [新增] 防止特征注入数值爆炸的关键层
+        self.secret_norm = nn.GroupNorm(32, dim * 4)
+        self.secret_scale = nn.Parameter(torch.zeros(1)) 
 
         self.inc = nn.Conv2d(in_channels, dim, 3, padding=1)
 
@@ -50,25 +52,20 @@ class TriStreamMambaUNet(nn.Module):
         x2 = self.down1(x1)
         x3 = self.down2(x2)
 
-        # print("[DEBUG][Gen] x1:", x1.shape)
-        # print("[DEBUG][Gen] x2:", x2.shape)
-        # print("[DEBUG][Gen] x3:", x3.shape)
-
-        # assert x3.shape[2] == 64, \
-        #     f"[FATAL] Bottleneck must be 64x64 but got {x3.shape}"
-
         h_struc = x3
 
+        # 调整 secret_emb 大小以匹配 bottleneck
         s_feat = torch.nn.functional.interpolate(
             secret_emb,
             size=x3.shape[2:]
         )
 
-        s_feat = self.secret_proj(
-            s_feat.permute(0, 2, 3, 1)
-        ).permute(0, 3, 1, 2)
-
-        h_tex = h_struc + s_feat
+        # [新增] 归一化处理，防止数值爆炸
+        s_feat = self.secret_proj(s_feat.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        s_feat = self.secret_norm(s_feat)
+        
+        # [新增] 使用 scale 控制注入强度 (h_tex = h_struc + s_feat * (1 + scale))
+        h_tex = h_struc + s_feat * (1.0 + self.secret_scale)
 
         x = self.bot(h_tex)
 
@@ -98,7 +95,7 @@ class MambaDecoderHead(nn.Module):
             nn.ReLU(),
             VisionMambaBlock(dim),
 
-            # 128 -> 64  ✅ stop here
+            # 128 -> 64
             nn.Conv2d(dim, dim * 2, 4, 2, 1),
             nn.ReLU(),
             VisionMambaBlock(dim * 2),
@@ -110,23 +107,30 @@ class MambaDecoderHead(nn.Module):
             1
         )
 
-    def forward(self, x):
-        feat = self.net(x)
-        # print("[DEBUG][Decoder] feat:", feat.shape)
+    # [修复关键] 这里增加了 target_shape 参数
+    def forward(self, x, target_shape=None):
+        """
+        Args:
+            x: Input tensor
+            target_shape: (H, W) tuple. 如果提供，将强制调整输出分辨率以匹配 RQ-VAE。
+        """
+        feat = self.net(x) # [B, dim*2, H_feat, W_feat]
 
-        # ===== 自检 =====
-        # assert feat.shape[2:] == (64, 64), (
-        #     f"[FATAL] Decoder must output 64x64, got {feat.shape}"
-        # )
+        # [Critical Fix] 动态分辨率对齐
+        # 确保 Decoder 输出的空间维度与 RQ-VAE 的 Latent Code 严格一致
+        if target_shape is not None:
+            if feat.shape[-2:] != target_shape:
+                feat = F.adaptive_avg_pool2d(feat, target_shape)
 
-        logits = self.head(feat)
+        logits = self.head(feat) # [B, Q*K, H_target, W_target]
         B, _, H, W = logits.shape
 
-        logits = logits.view(
-            B, self.num_q, self.cb_size, H * W
-        )
+        # [Critical Fix] 显式维度拆分，防止 view 错位
+        # 1. 拆分 Quantizers 和 Codebook
+        logits = logits.view(B, self.num_q, self.cb_size, H, W)
+        
+        # 2. 展平空间维度 (H, W) -> N
+        # 顺序必须是 (B, Q, K, N) 以匹配 Loss 函数中的处理
+        logits = logits.view(B, self.num_q, self.cb_size, -1)
 
-        # print("[DEBUG][Decoder] logits:", logits.shape)
-
-        # assert logits.shape[-1] == 4096
         return logits
