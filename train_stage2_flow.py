@@ -2,6 +2,7 @@
 import torch
 import yaml
 import os
+import math
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 from torch.optim import AdamW
@@ -11,7 +12,7 @@ from models.gen_flow import TriStreamMambaUNet, MambaDecoderHead
 from modules.losses import GenMambaLosses
 from modules.interference import InterferenceOperatorSet
 from data.dataset import get_dataloader
-from utils.helpers import set_seed, get_logger, save_image_grid, compute_psnr, compute_bit_accuracy, denormalize
+from utils.helpers import set_seed, get_logger, save_image_grid, compute_psnr, compute_bit_accuracy
 from tqdm import tqdm
 from accelerate import Accelerator
 import torch.nn.functional as F
@@ -68,7 +69,6 @@ def train_flow():
     # --- 2. Generator & Decoder ---
     gen_model = TriStreamMambaUNet(secret_dim=config['rqvae']['embed_dim'])
     
-    # Decoder 输出 Embedding
     decoder = MambaDecoderHead(
         num_quantizers=config['rqvae']['num_quantizers'],
         embed_dim=config['rqvae']['embed_dim'] 
@@ -88,18 +88,48 @@ def train_flow():
     )
     
     epochs = config['gen_flow']['epochs']
-    lambda_flow = config['gen_flow']['lambda_flow']
-    lambda_rsmi = config['gen_flow']['lambda_rsmi']
-    lambda_robust = config['gen_flow']['lambda_robust']
+    
+    # --- [核心修改] 三阶段课程学习参数配置 ---
+    STAGE1_END = 200  # 纯生成阶段结束点
+    STAGE2_END = 600  # 混合爬坡阶段结束点 (给足时间慢慢适应)
+    
+    # 基础权重
+    base_lambda_flow = 5.0     # 始终保持较高的生成权重，防止画崩
+    base_lambda_rsmi = 0.1
+    target_lambda_robust = 1.0 # 最终隐写权重的目标值
 
     # --- Training Loop ---
     for epoch in range(epochs):
         gen_model.train()
         decoder.train()
         
+        # --- [核心修改] 动态计算当前权重 ---
+        if epoch < STAGE1_END:
+            # 第一阶段：专注画质
+            current_lambda_flow = base_lambda_flow
+            current_lambda_robust = 0.0
+            stage_name = "Stage 1: Image Gen Warmup"
+            
+        elif epoch < STAGE2_END:
+            # 第二阶段：线性增加隐写权重 (Curriculum)
+            # progress 从 0.0 变到 1.0
+            progress = (epoch - STAGE1_END) / (STAGE2_END - STAGE1_END)
+            current_lambda_flow = base_lambda_flow
+            current_lambda_robust = target_lambda_robust * progress
+            stage_name = f"Stage 2: Stego Curriculum ({progress*100:.1f}%)"
+            
+        else:
+            # 第三阶段：完全体联合训练
+            current_lambda_flow = base_lambda_flow
+            current_lambda_robust = target_lambda_robust
+            stage_name = "Stage 3: Full Joint Training"
+
+        if accelerator.is_main_process:
+            logger.info(f"Epoch {epoch} | {stage_name} | Robust Weight: {current_lambda_robust:.4f}")
+
         tqdm_bar = tqdm(
             train_loader, 
-            desc=f"Epoch {epoch+1}/{epochs} [Flow Train]", 
+            desc=f"Ep {epoch+1}", 
             disable=not accelerator.is_main_process,
             leave=False
         )
@@ -125,22 +155,28 @@ def train_flow():
             loss_flow = GenMambaLosses.flow_matching_loss(v_pred, x_0, x_1)
             loss_rsmi = GenMambaLosses.rSMI_loss(h_struc, h_tex)
             
-            # Robust Decoding
-            x_1_pred = x_t + (1 - t_view) * v_pred 
-            x_attacked = interfere(x_1_pred, severity='strong')
+            # Robust Decoding Loss
+            # 只有当权重 > 0 时才计算，节省 Stage 1 的算力
+            if current_lambda_robust > 0:
+                x_1_pred = x_t + (1 - t_view) * v_pred 
+                x_attacked = interfere(x_1_pred, severity='strong')
+                pred_features = decoder(x_attacked, target_shape=s_indices.shape[-2:])
+                loss_robust = GenMambaLosses.hDCE_loss(
+                    pred_features, s_indices, codebooks, temperature=0.1
+                )
+            else:
+                loss_robust = torch.tensor(0.0, device=accelerator.device, requires_grad=True)
             
-            pred_features = decoder(x_attacked, target_shape=s_indices.shape[-2:])
-            
-            loss_robust = GenMambaLosses.hDCE_loss(
-                pred_features, s_indices, codebooks, temperature=0.1
-            )
-            
-            total_loss = lambda_flow * loss_flow + lambda_rsmi * loss_rsmi + lambda_robust * loss_robust
+            # Total Loss
+            total_loss = (current_lambda_flow * loss_flow + 
+                          base_lambda_rsmi * loss_rsmi + 
+                          current_lambda_robust * loss_robust)
             
             opt_gen.zero_grad()
             opt_dec.zero_grad()
             accelerator.backward(total_loss)
             
+            # 梯度裁剪
             accelerator.clip_grad_norm_(gen_model.parameters(), 1.0)
             accelerator.clip_grad_norm_(decoder.parameters(), 1.0)
             
@@ -150,7 +186,8 @@ def train_flow():
             if accelerator.is_main_process:
                 tqdm_bar.set_postfix(
                     flow=f"{loss_flow.item():.2f}",
-                    robust=f"{loss_robust.item():.2f}"
+                    robust=f"{loss_robust.item():.2f}",
+                    w_rob=f"{current_lambda_robust:.2f}"
                 )
         
         accelerator.wait_for_everyone()
@@ -198,12 +235,9 @@ def validate_multigpu(accelerator, gen_model, decoder, rqvae, val_loader, text_e
             pred_indices_list = []
             
             for q in range(Q):
-                # 1. Query: [N, C]
                 feat_q = pred_features[:, q].permute(0, 2, 3, 1).reshape(-1, C)
                 feat_q = F.normalize(feat_q, dim=1)
                 
-                # 2. Key: Codebook [K, C]
-                # [关键修复] 添加与 losses.py 相同的维度处理逻辑
                 if isinstance(codebooks, list):
                     cb = codebooks[q]
                 elif codebooks.ndim == 3:
@@ -211,17 +245,10 @@ def validate_multigpu(accelerator, gen_model, decoder, rqvae, val_loader, text_e
                 else:
                     cb = codebooks
                 
-                # 强力维度清洗: [1, K, C] -> [K, C]
-                if cb.ndim == 3:
-                    cb = cb.squeeze(0)
-                if cb.ndim != 2 and cb.shape[-1] == C:
-                    cb = cb.view(-1, C)
-                    
+                if cb.ndim == 3: cb = cb.squeeze(0)
+                if cb.ndim != 2 and cb.shape[-1] == C: cb = cb.view(-1, C)
                 cb = F.normalize(cb, dim=1)
                 
-                # 3. Retrieval
-                # 现在 cb 是 [1024, 256]，我们使用 transpose 变成 [256, 1024]
-                # matmul: [N, 256] x [256, 1024] -> [N, 1024]
                 idx = torch.matmul(feat_q, cb.transpose(0, 1)).argmax(dim=1).view(B, H, W)
                 pred_indices_list.append(idx)
                 
