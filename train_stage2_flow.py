@@ -2,7 +2,6 @@
 import torch
 import yaml
 import os
-# 设置国内镜像，防止连接 HuggingFace 超时
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 from torch.optim import AdamW
@@ -12,18 +11,15 @@ from models.gen_flow import TriStreamMambaUNet, MambaDecoderHead
 from modules.losses import GenMambaLosses
 from modules.interference import InterferenceOperatorSet
 from data.dataset import get_dataloader
-from utils.helpers import set_seed, get_logger, save_image_grid, compute_psnr, compute_bit_accuracy
+from utils.helpers import set_seed, get_logger, save_image_grid, compute_psnr, compute_bit_accuracy, denormalize
 from tqdm import tqdm
 from accelerate import Accelerator
+import torch.nn.functional as F
 
 def train_flow():
-    # 1. 初始化 Accelerator
     accelerator = Accelerator()
-    
-    # 设置随机种子 (各进程不同)
     set_seed(42 + accelerator.process_index)
     
-    # 2. 路径与配置 setup
     base_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(base_dir, 'configs/config.yaml')
     
@@ -38,75 +34,68 @@ def train_flow():
         os.makedirs(ckpt_dir, exist_ok=True)
         os.makedirs(res_dir, exist_ok=True)
         logger = get_logger(log_dir, "GenFlow_Train")
-        logger.info(f"Accelerator Initialized. Device: {accelerator.device}")
+        logger.info(f"Accelerator Initialized. Device: {accelerator.device}, Num Processes: {accelerator.num_processes}")
     else:
         logger = None
     
-    # 3. Models Initialization
-    # A. RQ-VAE (Frozen)
-    # [修复] 显式传入 num_quantizers
+    # --- 1. Load RQ-VAE ---
     rqvae = SecretRQVAE(
         embed_dim=config['rqvae']['embed_dim'],
         num_quantizers=config['rqvae']['num_quantizers']
     )
-    rqvae.to(accelerator.device) 
     
     rqvae_path = os.path.join(base_dir, config['experiment']['checkpoint_dir'], "stage1_rqvae", "best_rqvae.pth")
     if os.path.exists(rqvae_path):
-        rqvae.load_state_dict(torch.load(rqvae_path, map_location=accelerator.device))
+        state_dict = torch.load(rqvae_path, map_location='cpu')
+        rqvae.load_state_dict(state_dict)
         if accelerator.is_main_process:
             logger.info(f"Loaded RQ-VAE from {rqvae_path}")
     else:
-        if accelerator.is_main_process:
-            logger.warning("RQ-VAE checkpoint not found! Using random initialization.")
+        raise FileNotFoundError("RQ-VAE checkpoint is required!")
+    
+    rqvae.to(accelerator.device) 
     rqvae.eval()
     rqvae.requires_grad_(False)
     
-    # B. Generator & Decoder
-    gen_model = TriStreamMambaUNet(secret_dim=config['rqvae']['embed_dim'])
-    decoder = MambaDecoderHead(num_quantizers=config['rqvae']['num_quantizers'])
+    # 提取 Codebooks
+    codebooks = []
+    if hasattr(rqvae.rq, 'layers'):
+        for layer in rqvae.rq.layers:
+            codebooks.append(layer._codebook.embed.detach()) 
+    else:
+        codebooks = rqvae.rq.codebook.detach()
     
-    # C. Helpers
+    # --- 2. Generator & Decoder ---
+    gen_model = TriStreamMambaUNet(secret_dim=config['rqvae']['embed_dim'])
+    
+    # Decoder 输出 Embedding
+    decoder = MambaDecoderHead(
+        num_quantizers=config['rqvae']['num_quantizers'],
+        embed_dim=config['rqvae']['embed_dim'] 
+    )
+    
     text_enc = TextEncoderWrapper().to(accelerator.device)
     interfere = InterferenceOperatorSet().to(accelerator.device)
     
-    # 4. Optimizers
     opt_gen = AdamW(gen_model.parameters(), lr=float(config['gen_flow']['learning_rate']))
     opt_dec = AdamW(decoder.parameters(), lr=float(config['gen_flow']['learning_rate']))
     
-    # 5. Dataloaders
     train_loader = get_dataloader(config, split='train')
     val_loader = get_dataloader(config, split='val')
     
-    # 6. Prepare with Accelerator
     gen_model, decoder, opt_gen, opt_dec, train_loader, val_loader = accelerator.prepare(
         gen_model, decoder, opt_gen, opt_dec, train_loader, val_loader
     )
     
     epochs = config['gen_flow']['epochs']
-    
-    # Loss Weights
     lambda_flow = config['gen_flow']['lambda_flow']
     lambda_rsmi = config['gen_flow']['lambda_rsmi']
-    lambda_robust_base = config['gen_flow']['lambda_robust']
+    lambda_robust = config['gen_flow']['lambda_robust']
 
-    # [Warmup] 定义预热轮数
-    WARMUP_EPOCHS = 5
-
+    # --- Training Loop ---
     for epoch in range(epochs):
         gen_model.train()
         decoder.train()
-        
-        # 动态调整 lambda_robust (Warmup)
-        if epoch < WARMUP_EPOCHS:
-            current_lambda_robust = 0.0
-            if accelerator.is_main_process and epoch == 0:
-                logger.info(f"Warmup: robust loss disabled for first {WARMUP_EPOCHS} epochs.")
-        else:
-            current_lambda_robust = lambda_robust_base
-
-        total_loss_meter = 0
-        robust_loss_meter = 0
         
         tqdm_bar = tqdm(
             train_loader, 
@@ -116,144 +105,167 @@ def train_flow():
         )
         
         for i, (target_img, secret_img, prompts) in enumerate(tqdm_bar):
-            # 1. Prepare Inputs
+            # Inputs
             with torch.no_grad():
                 txt_emb = text_enc(prompts, accelerator.device)
                 _, s_indices, _, s_feat = rqvae(secret_img)
-                # 获取真实的 Latent 尺寸 [B, Q, H, W]
-                B_idx, Q_idx, H_lat, W_lat = s_indices.shape
             
-            # 2. Flow Matching Training
+            # Flow Setup
             B = target_img.shape[0]
             t = torch.rand(B).to(accelerator.device)
             x_0 = torch.randn_like(target_img).to(accelerator.device)
+            x_1 = target_img
             t_view = t.view(B, 1, 1, 1)
-            x_t = t_view * target_img + (1 - t_view) * x_0
+            x_t = t_view * x_1 + (1 - t_view) * x_0 
             
-            # 3. Forward
+            # Forward
             v_pred, h_struc, h_tex = gen_model(x_t, t, txt_emb, s_feat)
             
-            # 4. Losses
-            loss_flow = GenMambaLosses.flow_matching_loss(v_pred, x_0, target_img)
+            # Losses
+            loss_flow = GenMambaLosses.flow_matching_loss(v_pred, x_0, x_1)
             loss_rsmi = GenMambaLosses.rSMI_loss(h_struc, h_tex)
             
-            # 5. Robustness Guidance
-            x_0_pred = x_t - (1 - t_view) * v_pred 
-            x_attacked = interfere(x_0_pred, severity='strong') 
+            # Robust Decoding
+            x_1_pred = x_t + (1 - t_view) * v_pred 
+            x_attacked = interfere(x_1_pred, severity='strong')
             
-            # [关键] 传入目标分辨率，确保对齐
-            # 注意：这需要 models/gen_flow.py 中的 MambaDecoderHead 已经更新支持 target_shape
-            pred_logits = decoder(x_attacked, target_shape=(H_lat, W_lat))
+            pred_features = decoder(x_attacked, target_shape=s_indices.shape[-2:])
             
-            s_indices_flat = s_indices.view(B_idx, Q_idx, -1)
-            loss_robust = GenMambaLosses.robust_decode_loss(pred_logits, s_indices_flat)
+            loss_robust = GenMambaLosses.hDCE_loss(
+                pred_features, s_indices, codebooks, temperature=0.1
+            )
             
-            total_loss = lambda_flow * loss_flow + lambda_rsmi * loss_rsmi + current_lambda_robust * loss_robust
+            total_loss = lambda_flow * loss_flow + lambda_rsmi * loss_rsmi + lambda_robust * loss_robust
             
             opt_gen.zero_grad()
             opt_dec.zero_grad()
             accelerator.backward(total_loss)
+            
+            accelerator.clip_grad_norm_(gen_model.parameters(), 1.0)
+            accelerator.clip_grad_norm_(decoder.parameters(), 1.0)
+            
             opt_gen.step()
             opt_dec.step()
             
-            total_loss_meter += total_loss.item()
-            robust_loss_meter += loss_robust.item()
-
             if accelerator.is_main_process:
                 tqdm_bar.set_postfix(
-                    total=f"{total_loss.item():.4f}",
-                    robust=f"{loss_robust.item():.4f}"
+                    flow=f"{loss_flow.item():.2f}",
+                    robust=f"{loss_robust.item():.2f}"
                 )
-                if i % 50 == 0:
-                    logger.info(f"Epoch [{epoch}][{i}] Total: {total_loss.item():.4f} Robust: {loss_robust.item():.4f}")
         
         accelerator.wait_for_everyone()
         
-        # Validation Loop
         if epoch % 5 == 0:
-            gen_model.eval()
-            decoder.eval()
-            val_stego_psnr = 0
-            val_bit_acc = 0
+            validate_multigpu(accelerator, gen_model, decoder, rqvae, val_loader, text_enc, interfere, codebooks, epoch, res_dir, logger, config)
             
-            with torch.no_grad():
-                for val_batch_idx, (val_target, val_secret, val_prompts) in enumerate(val_loader):
-                    # Prepare Inputs
-                    txt_emb = text_enc(val_prompts, accelerator.device)
-                    _, s_indices, _, s_feat = rqvae(val_secret)
-                    B_val, Q_val, H_lat_val, W_lat_val = s_indices.shape
-                    
-                    # Euler Sampling
-                    x_gen = torch.randn_like(val_target).to(accelerator.device)
-                    dt = 1.0 / 20
-                    for k in range(20):
-                        t_val = torch.tensor([k/20.0]).to(accelerator.device)
-                        v_val, _, _ = gen_model(x_gen, t_val, txt_emb, s_feat)
-                        x_gen = x_gen + v_val * dt
-                    
-                    # Metrics
-                    val_stego_psnr += compute_psnr(val_target, x_gen)
-                    
-                    # Attack & Decode
-                    x_val_attacked = interfere(x_gen, severity='weak')
-                    
-                    # [关键] 对齐分辨率
-                    logits = decoder(x_val_attacked, target_shape=(H_lat_val, W_lat_val))
-                    pred_idx = logits.argmax(dim=2) # [B, Q, N]
-                    
-                    s_indices_flat = s_indices.view(B_val, Q_val, -1)
-                    val_bit_acc += compute_bit_accuracy(pred_idx, s_indices_flat)
-                    
-                    # Visualization (Only first batch of main process)
-                    if val_batch_idx == 0 and accelerator.is_main_process and epoch % 10 == 0:
-                        # [修复] 动态获取 num_quantizers
-                        num_q_vis = config['rqvae']['num_quantizers']
-                        
-                        # 安全检查
-                        model_q = getattr(rqvae.rq, 'num_quantizers', num_q_vis)
-                        
-                        if model_q != num_q_vis:
-                            logger.warning(f"Visualization Skipped: Config Q={num_q_vis} != Model Q={model_q}")
-                        else:
-                            try:
-                                # pred_idx: [B, Q, N]
-                                # 转换为 [B, N, Q] 供 RQ-VAE 解码
-                                pred_indices = pred_idx.permute(0, 2, 1).contiguous()
-                                
-                                # RQ-VAE Decode -> 得到 [B, N, C]
-                                recon_secret_feat = rqvae.rq.get_output_from_indices(pred_indices)
-                                
-                                # [关键修复]: 先 view 回 [B, H, W, C] 再 permute
-                                # 之前的错误是直接对 3D 张量 [B, N, C] 做了 4D 的 permute
-                                recon_secret_feat = recon_secret_feat.view(B_val, H_lat_val, W_lat_val, -1)
-                                recon_secret_feat = recon_secret_feat.permute(0, 3, 1, 2).contiguous()
-                                
-                                # Decoder
-                                recon_secret = rqvae.decoder(recon_secret_feat)
-                                
-                                vis_row = torch.cat([val_target, x_gen, val_secret, recon_secret], dim=0)
-                                save_path = os.path.join(res_dir, f"val_step_{epoch}.png")
-                                os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                                save_image_grid(vis_row, save_path, nrow=B_val)
-                            except Exception as e:
-                                # 捕获异常防止中断训练
-                                logger.warning(f"Visualization Error: {e}")
-
-                    break # 只验证一个 batch
-            
-            if accelerator.is_main_process:
-                logger.info(f"VAL Epoch {epoch}: Stego PSNR: {val_stego_psnr:.2f} | Bit Acc: {val_bit_acc:.4f}")
-            
-            accelerator.wait_for_everyone()
             if accelerator.is_main_process:
                 unwrapped_gen = accelerator.unwrap_model(gen_model)
                 unwrapped_dec = accelerator.unwrap_model(decoder)
-                
                 torch.save(unwrapped_gen.state_dict(), os.path.join(ckpt_dir, f"gen_epoch_{epoch}.pth"))
                 torch.save(unwrapped_dec.state_dict(), os.path.join(ckpt_dir, f"dec_epoch_{epoch}.pth"))
-
+    
     if accelerator.is_main_process:
         logger.info("Training Finished.")
+
+def validate_multigpu(accelerator, gen_model, decoder, rqvae, val_loader, text_enc, interfere, codebooks, epoch, res_dir, logger, config):
+    gen_model.eval()
+    decoder.eval()
+    
+    local_metrics = {'psnr_sum': 0.0, 'bit_acc_sum': 0.0, 'count': 0}
+    
+    with torch.no_grad():
+        for i, (val_target, val_secret, val_prompts) in enumerate(val_loader):
+            txt_emb = text_enc(val_prompts, accelerator.device)
+            _, s_indices, _, s_feat = rqvae(val_secret)
+            
+            # Sampling
+            x_curr = torch.randn_like(val_target).to(accelerator.device)
+            steps = 20
+            dt = 1.0 / steps
+            for k in range(steps):
+                t = torch.tensor([k/steps]).to(accelerator.device)
+                v_pred, _, _ = gen_model(x_curr, t, txt_emb, s_feat)
+                x_curr = x_curr + v_pred * dt
+            
+            x_stego = x_curr
+            x_attacked = interfere(x_stego, severity='weak')
+            
+            # Decode
+            pred_features = decoder(x_attacked, target_shape=s_indices.shape[-2:])
+            
+            # Retrieval
+            B, Q, C, H, W = pred_features.shape
+            pred_indices_list = []
+            
+            for q in range(Q):
+                # 1. Query: [N, C]
+                feat_q = pred_features[:, q].permute(0, 2, 3, 1).reshape(-1, C)
+                feat_q = F.normalize(feat_q, dim=1)
+                
+                # 2. Key: Codebook [K, C]
+                # [关键修复] 添加与 losses.py 相同的维度处理逻辑
+                if isinstance(codebooks, list):
+                    cb = codebooks[q]
+                elif codebooks.ndim == 3:
+                    cb = codebooks[q]
+                else:
+                    cb = codebooks
+                
+                # 强力维度清洗: [1, K, C] -> [K, C]
+                if cb.ndim == 3:
+                    cb = cb.squeeze(0)
+                if cb.ndim != 2 and cb.shape[-1] == C:
+                    cb = cb.view(-1, C)
+                    
+                cb = F.normalize(cb, dim=1)
+                
+                # 3. Retrieval
+                # 现在 cb 是 [1024, 256]，我们使用 transpose 变成 [256, 1024]
+                # matmul: [N, 256] x [256, 1024] -> [N, 1024]
+                idx = torch.matmul(feat_q, cb.transpose(0, 1)).argmax(dim=1).view(B, H, W)
+                pred_indices_list.append(idx)
+                
+            pred_indices = torch.stack(pred_indices_list, dim=1)
+            
+            # Metrics
+            batch_psnr = compute_psnr(val_target, x_stego)
+            batch_acc = compute_bit_accuracy(pred_indices, s_indices)
+            
+            local_metrics['psnr_sum'] += batch_psnr
+            local_metrics['bit_acc_sum'] += batch_acc
+            local_metrics['count'] += 1
+            
+            if i == 0 and accelerator.is_main_process:
+                # Vis
+                idxs = pred_indices.permute(0, 2, 3, 1)
+                recon_secret_feat = rqvae.rq.get_output_from_indices(idxs).permute(0, 3, 1, 2)
+                recon_secret = rqvae.decoder(recon_secret_feat)
+                vis = torch.cat([val_target, x_stego, val_secret, recon_secret], dim=0)
+                save_image_grid(vis, os.path.join(res_dir, f"val_{epoch}.png"), nrow=B)
+            
+            if i > 10: break
+
+    # Gather Metrics
+    metrics_tensor = torch.tensor([
+        local_metrics['psnr_sum'], 
+        local_metrics['bit_acc_sum'], 
+        local_metrics['count']
+    ], device=accelerator.device)
+    
+    gathered_metrics = accelerator.gather(metrics_tensor)
+    
+    if accelerator.is_main_process:
+        if gathered_metrics.ndim == 1:
+             gathered_metrics = gathered_metrics.view(-1, 3)
+        
+        total_psnr = gathered_metrics[:, 0].sum().item()
+        total_acc = gathered_metrics[:, 1].sum().item()
+        total_count = gathered_metrics[:, 2].sum().item()
+        
+        if total_count > 0:
+            avg_psnr = total_psnr / total_count
+            avg_acc = total_acc / total_count
+            logger.info(f"VAL Epoch {epoch} (Global): Stego PSNR {avg_psnr:.2f} | Bit Acc {avg_acc:.4f}")
 
 if __name__ == "__main__":
     train_flow()
